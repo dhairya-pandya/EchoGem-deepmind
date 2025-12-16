@@ -4,6 +4,7 @@ Transcript chunking module using Google Gemini for intelligent segmentation.
 
 import os
 import json
+import re
 import google.generativeai as genai
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer
@@ -139,17 +140,55 @@ class Chunker:
         }}
         """
 
+    def _extract_json_from_response(self, response_text: str) -> str:
+        """Extract JSON from LLM response, handling various formats"""
+        # Try markdown code blocks first
+        code_block_pattern = r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'
+        matches = re.findall(code_block_pattern, response_text, re.DOTALL)
+        if matches:
+            json_str = max(matches, key=len).strip()
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError:
+                pass
+        
+        # Find JSON with balanced braces
+        brace_count = 0
+        start_idx = -1
+        
+        for i, char in enumerate(response_text):
+            if char == '{':
+                if brace_count == 0:
+                    start_idx = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and start_idx != -1:
+                    json_str = response_text[start_idx:i + 1]
+                    try:
+                        json.loads(json_str)
+                        return json_str
+                    except json.JSONDecodeError:
+                        start_idx = -1
+                        brace_count = 0
+                        continue
+        
+        # Fallback: find first { and last }
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        
+        if start_idx == -1 or end_idx == 0:
+            raise ValueError("No JSON found in response")
+        
+        json_str = response_text[start_idx:end_idx]
+        json.loads(json_str)
+        return json_str
+
     def _parse_chunk_response(self, response_text: str) -> List[Chunk]:
         """Parse the LLM response into Chunk objects"""
         try:
-            # Extract JSON from response
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
-            
-            if start_idx == -1 or end_idx == 0:
-                raise ValueError("No JSON found in response")
-            
-            json_str = response_text[start_idx:end_idx]
+            json_str = self._extract_json_from_response(response_text)
             data = json.loads(json_str)
             
             chunks = []
@@ -166,27 +205,128 @@ class Chunker:
             
             return chunks
             
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error parsing chunk response: {e}")
+            return []
         except Exception as e:
             print(f"Error parsing chunk response: {e}")
             return []
 
-    def _fallback_chunking(self, transcript: str) -> List[Chunk]:
-        """Fallback chunking method using simple text splitting"""
-        words = transcript.split()
-        chunks = []
-        chunk_size = self.max_tokens
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences"""
+        sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])(?=\s*$)'
+        sentences = re.split(sentence_pattern, text)
         
-        for i in range(0, len(words), chunk_size):
-            chunk_words = words[i:i + chunk_size]
-            chunk_text = ' '.join(chunk_words)
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence:
+                cleaned_sentences.append(sentence)
+        
+        if not cleaned_sentences:
+            return [text.strip()] if text.strip() else []
+        
+        return cleaned_sentences
+
+    def _group_sentences_into_chunks(
+        self, 
+        sentences: List[str], 
+        max_words: int,
+        flexibility: int = 200
+    ) -> List[str]:
+        """Group sentences into chunks respecting max_words limit"""
+        if not sentences:
+            return []
+        
+        chunks = []
+        current_chunk = []
+        current_word_count = 0
+        
+        min_words = max(1, max_words - flexibility)
+        max_words_actual = max_words + flexibility
+        
+        for sentence in sentences:
+            sentence_words = len(sentence.split())
+            
+            if current_word_count + sentence_words > max_words_actual and current_chunk:
+                if current_word_count >= min_words:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [sentence]
+                    current_word_count = sentence_words
+                else:
+                    current_chunk.append(sentence)
+                    current_word_count += sentence_words
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = []
+                    current_word_count = 0
+            else:
+                current_chunk.append(sentence)
+                current_word_count += sentence_words
+        
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
+
+    def _fallback_chunking(self, transcript: str) -> List[Chunk]:
+        """Fallback chunking method using sentence-aware text splitting"""
+        if not transcript.strip():
+            return []
+        
+        # Split into paragraphs first
+        paragraphs = re.split(r'\n\s*\n+', transcript)
+        
+        # Split paragraphs into sentences
+        all_sentences = []
+        for para in paragraphs:
+            para = para.strip()
+            if para:
+                sentences = self._split_into_sentences(para)
+                all_sentences.extend(sentences)
+        
+        # Fallback to basic sentence splitting
+        if not all_sentences:
+            all_sentences = [s.strip() for s in re.split(r'[.!?]+\s+', transcript) if s.strip()]
+        
+        # Ultimate fallback: word-based chunking
+        if not all_sentences:
+            words = transcript.split()
+            chunks = []
+            chunk_size = self.max_tokens
+            
+            for i in range(0, len(words), chunk_size):
+                chunk_words = words[i:i + chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                
+                chunk = Chunk(
+                    title=f"Chunk {len(chunks) + 1}",
+                    content=chunk_text,
+                    keywords=[],
+                    named_entities=[],
+                    timestamp_range="",
+                    chunk_id=f"fallback_chunk_{len(chunks)}"
+                )
+                chunks.append(chunk)
+            
+            return chunks
+        
+        # Group sentences into chunks
+        chunk_texts = self._group_sentences_into_chunks(all_sentences, self.max_tokens)
+        
+        chunks = []
+        for i, chunk_text in enumerate(chunk_texts):
+            first_words = chunk_text.split()[:5]
+            title = ' '.join(first_words)
+            if len(title) > 50:
+                title = title[:47] + "..."
             
             chunk = Chunk(
-                title=f"Chunk {len(chunks) + 1}",
+                title=title if title else f"Chunk {i + 1}",
                 content=chunk_text,
                 keywords=[],
                 named_entities=[],
                 timestamp_range="",
-                chunk_id=f"fallback_chunk_{len(chunks)}"
+                chunk_id=f"fallback_chunk_{i}"
             )
             chunks.append(chunk)
         
